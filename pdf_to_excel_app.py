@@ -49,7 +49,8 @@ def try_extract_text_layer(page):
         for t in tables.tables:
             data = t.extract()
             if data and len(data) > 1:
-                df = pd.DataFrame(data[1:], columns=data[0])
+                header = make_unique_headers([str(h) if h is not None else "" for h in data[0]])
+                df = pd.DataFrame(data[1:], columns=header)
                 dfs.append(df)
         if dfs:
             return dfs
@@ -121,6 +122,21 @@ def ocr_page_to_rows(image, row_tolerance=12, col_gap_factor=2.2):
     return structured_rows
 
 
+def make_unique_headers(header):
+    """Ensure no two column names are identical (required by pandas/pyarrow for display)."""
+    seen = {}
+    unique = []
+    for i, h in enumerate(header):
+        name = h.strip() if h and h.strip() else f"Column {i + 1}"
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}_{seen[name]}"
+        else:
+            seen[name] = 0
+        unique.append(name)
+    return unique
+
+
 def rows_to_dataframe(rows):
     """Pad rows to equal length and build a DataFrame, using the first row as header."""
     if not rows:
@@ -128,7 +144,7 @@ def rows_to_dataframe(rows):
     max_cols = max(len(r) for r in rows)
     padded = [r + [""] * (max_cols - len(r)) for r in rows]
     header, *body = padded
-    header = [h if h else f"Column {i+1}" for i, h in enumerate(header)]
+    header = make_unique_headers(header)
     df = pd.DataFrame(body, columns=header)
     return df
 
@@ -217,7 +233,12 @@ if st.session_state.preview_sheets:
     st.subheader("Preview")
     for name, df in st.session_state.preview_sheets.items():
         with st.expander(f"Sheet: {name} ({len(df)} rows)"):
-            st.dataframe(df, use_container_width=True)
+            try:
+                st.dataframe(df, use_container_width=True)
+            except Exception:
+                # Fall back to a plain string rendering if Arrow conversion fails
+                # (e.g. mixed data types or any other column-compatibility issue)
+                st.dataframe(df.astype(str), use_container_width=True)
 
 # 3. Download button
 if st.session_state.excel_bytes:
