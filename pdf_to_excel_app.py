@@ -1,6 +1,10 @@
 """
-PDF to Excel Converter (works with scanned / image-based PDFs too)
+PDF to Excel Converter — supports multiple PDFs (scanned or digital)
 --------------------------------------------------------------------
+Each uploaded PDF is converted into its OWN Excel workbook (single sheet
+per workbook, merging all pages of that PDF into one continuous table).
+You can download workbooks individually, or all at once as a ZIP.
+
 Run locally with:
     python -m streamlit run pdf_to_excel_app.py
 
@@ -21,7 +25,9 @@ Deploying on Streamlit Community Cloud:
 """
 
 import io
+import os
 import shutil
+import zipfile
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -40,11 +46,11 @@ if _TESSERACT_PATH:
 
 st.set_page_config(page_title="PDF to Excel Converter", layout="wide")
 st.title("📄 PDF to Excel Converter")
-st.caption("Upload a PDF (scanned or digital) → Submit → Download the extracted data as a single-sheet Excel file.")
+st.caption("Upload one or more PDFs (scanned or digital) → Submit → Download each as its own Excel workbook.")
 
 
 # ----------------------------------------------------------------------
-# Core conversion logic
+# Core conversion logic (per PDF)
 # ----------------------------------------------------------------------
 def pdf_page_to_image(page, zoom=3.0):
     """Render a PDF page to a PIL image at high resolution for better OCR accuracy."""
@@ -167,12 +173,12 @@ def make_unique_headers(header):
 
 def convert_pdf_to_single_table(pdf_bytes, progress_callback=None):
     """
-    Main pipeline — merges every page into ONE continuous table (single sheet):
+    Merges every page of ONE PDF into a single continuous table:
       - Tries native table extraction first (accurate for digital PDFs)
       - Falls back to OCR-based reconstruction for scanned/image-only pages
       - Uses the first row found as the master header
       - Automatically skips rows on later pages that look like a repeated header
-    Returns a single pandas DataFrame.
+    Returns a single pandas DataFrame for that PDF.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     master_header = None
@@ -216,7 +222,7 @@ def convert_pdf_to_single_table(pdf_bytes, progress_callback=None):
 
 
 def build_excel_bytes(df: pd.DataFrame):
-    """Write the single merged table to one Excel sheet."""
+    """Write a single DataFrame to one Excel sheet, return the workbook's bytes."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         if df.empty:
@@ -226,16 +232,28 @@ def build_excel_bytes(df: pd.DataFrame):
         else:
             df.to_excel(writer, index=False, sheet_name="Sheet1")
     output.seek(0)
-    return output
+    return output.getvalue()
+
+
+def build_zip_of_workbooks(results: dict):
+    """results: {output_filename: excel_bytes} -> zip file bytes containing all of them."""
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for filename, excel_bytes in results.items():
+            zf.writestr(filename, excel_bytes)
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
 
 
 # ----------------------------------------------------------------------
 # Streamlit UI
 # ----------------------------------------------------------------------
-if "excel_bytes" not in st.session_state:
-    st.session_state.excel_bytes = None
-if "preview_df" not in st.session_state:
-    st.session_state.preview_df = None
+if "results" not in st.session_state:
+    st.session_state.results = {}          # {output_filename: excel_bytes}
+if "previews" not in st.session_state:
+    st.session_state.previews = {}         # {output_filename: DataFrame}
+if "zip_bytes" not in st.session_state:
+    st.session_state.zip_bytes = None
 
 if _TESSERACT_PATH is None:
     st.warning(
@@ -244,48 +262,89 @@ if _TESSERACT_PATH is None:
         "installed (see the instructions at the top of this file / packages.txt for Streamlit Cloud)."
     )
 
-# 1. Upload button
-uploaded_file = st.file_uploader("Upload PDF file", type=["pdf"])
+# 1. Upload button (now accepts multiple files)
+uploaded_files = st.file_uploader(
+    "Upload PDF file(s)", type=["pdf"], accept_multiple_files=True
+)
 
 # 2. Submit button
-if st.button("Submit", type="primary", disabled=uploaded_file is None):
-    if uploaded_file is not None:
-        pdf_bytes = uploaded_file.read()
-        progress_bar = st.progress(0, text="Starting conversion...")
+if st.button("Submit", type="primary", disabled=not uploaded_files):
+    st.session_state.results = {}
+    st.session_state.previews = {}
+    st.session_state.zip_bytes = None
 
-        def update_progress(current, total):
-            progress_bar.progress(current / total, text=f"Processing page {current} of {total}...")
+    overall_progress = st.progress(0, text="Starting conversion...")
+    tesseract_missing = False
 
-        with st.spinner("Converting PDF to Excel — scanned pages are processed with OCR, this may take a moment..."):
-            try:
-                df = convert_pdf_to_single_table(pdf_bytes, progress_callback=update_progress)
-                excel_io = build_excel_bytes(df)
-                st.session_state.excel_bytes = excel_io.getvalue()
-                st.session_state.preview_df = df
-                progress_bar.empty()
-                st.success(f"Conversion complete — {len(df)} rows extracted into a single sheet.")
-            except pytesseract.pytesseract.TesseractNotFoundError:
-                progress_bar.empty()
-                st.error(
-                    "Tesseract OCR engine is not installed on this server, so scanned pages "
-                    "can't be read. If you're on Streamlit Community Cloud, add a packages.txt "
-                    "file containing 'tesseract-ocr' to your repo and reboot the app. If running "
-                    "locally, install Tesseract (see instructions at the top of the script)."
-                )
+    for file_idx, uploaded_file in enumerate(uploaded_files):
+        base_name = os.path.splitext(uploaded_file.name)[0]
+        output_filename = f"{base_name}.xlsx"
 
-# Preview
-if st.session_state.preview_df is not None and not st.session_state.preview_df.empty:
-    st.subheader("Preview")
-    try:
-        st.dataframe(st.session_state.preview_df, use_container_width=True)
-    except Exception:
-        st.dataframe(st.session_state.preview_df.astype(str), use_container_width=True)
+        page_status = st.empty()
 
-# 3. Download button
-if st.session_state.excel_bytes:
+        def update_progress(current, total, _name=uploaded_file.name, _status=page_status):
+            _status.text(f"{_name}: processing page {current} of {total}...")
+
+        try:
+            pdf_bytes = uploaded_file.read()
+            df = convert_pdf_to_single_table(pdf_bytes, progress_callback=update_progress)
+            excel_bytes = build_excel_bytes(df)
+            st.session_state.results[output_filename] = excel_bytes
+            st.session_state.previews[output_filename] = df
+        except pytesseract.pytesseract.TesseractNotFoundError:
+            tesseract_missing = True
+            break
+        finally:
+            page_status.empty()
+
+        overall_progress.progress(
+            (file_idx + 1) / len(uploaded_files),
+            text=f"Completed {file_idx + 1} of {len(uploaded_files)} file(s)...",
+        )
+
+    overall_progress.empty()
+
+    if tesseract_missing:
+        st.error(
+            "Tesseract OCR engine is not installed on this server, so scanned pages "
+            "can't be read. If you're on Streamlit Community Cloud, add a packages.txt "
+            "file containing 'tesseract-ocr' to your repo and reboot the app. If running "
+            "locally, install Tesseract (see instructions at the top of the script)."
+        )
+    elif st.session_state.results:
+        if len(st.session_state.results) > 1:
+            st.session_state.zip_bytes = build_zip_of_workbooks(st.session_state.results)
+        st.success(f"Conversion complete — {len(st.session_state.results)} workbook(s) ready.")
+
+# Preview + individual download buttons
+if st.session_state.results:
+    st.subheader("Results")
+    for output_filename, excel_bytes in st.session_state.results.items():
+        df = st.session_state.previews.get(output_filename)
+        with st.expander(f"{output_filename}  ({0 if df is None else len(df)} rows)"):
+            if df is not None and not df.empty:
+                try:
+                    st.dataframe(df, use_container_width=True)
+                except Exception:
+                    st.dataframe(df.astype(str), use_container_width=True)
+            else:
+                st.info("No table data could be extracted from this PDF.")
+
+            # 3. Download button (per file)
+            st.download_button(
+                label=f"Download {output_filename}",
+                data=excel_bytes,
+                file_name=output_filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"download_{output_filename}",
+            )
+
+# Download-all option when multiple PDFs were converted
+if st.session_state.zip_bytes:
+    st.divider()
     st.download_button(
-        label="Download Excel File",
-        data=st.session_state.excel_bytes,
-        file_name="converted_output.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        label=f"⬇️ Download All {len(st.session_state.results)} Workbooks as ZIP",
+        data=st.session_state.zip_bytes,
+        file_name="converted_workbooks.zip",
+        mime="application/zip",
     )
