@@ -1,20 +1,27 @@
 """
 PDF to Excel Converter (works with scanned / image-based PDFs too)
 --------------------------------------------------------------------
-Run with:  streamlit run pdf_to_excel_app.py
+Run locally with:
+    python -m streamlit run pdf_to_excel_app.py
 
 Requirements (see requirements.txt):
-    pip install -r requirements.txt
+    python -m pip install -r requirements.txt
 
-System requirement:
-    Tesseract OCR engine must be installed on the machine running this app
-    (this is separate from the pytesseract python package).
-        Windows : https://github.com/UB-Mannheim/tesseract/wiki
-        macOS   : brew install tesseract
-        Linux   : sudo apt-get install tesseract-ocr
+System requirement (OCR engine, separate from the Python package):
+    Windows : https://github.com/UB-Mannheim/tesseract/wiki
+    macOS   : brew install tesseract
+    Linux   : sudo apt-get install tesseract-ocr
+
+Deploying on Streamlit Community Cloud:
+    Upload the included packages.txt alongside this file (and requirements.txt)
+    in the same GitHub repo. Streamlit Cloud reads packages.txt to install
+    system-level (apt) packages such as tesseract-ocr, which pip cannot install.
+    After adding it, click "Reboot app" (or push a new commit) so the app
+    rebuilds with it.
 """
 
 import io
+import shutil
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -22,12 +29,18 @@ import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
 
-# If Tesseract is not on PATH, uncomment and set the path below:
+# ----------------------------------------------------------------------
+# Locate the Tesseract binary automatically where possible.
+# On Windows, if it's installed but not on PATH, uncomment and set this:
 # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# ----------------------------------------------------------------------
+_TESSERACT_PATH = shutil.which("tesseract")
+if _TESSERACT_PATH:
+    pytesseract.pytesseract.tesseract_cmd = _TESSERACT_PATH
 
 st.set_page_config(page_title="PDF to Excel Converter", layout="wide")
 st.title("📄 PDF to Excel Converter")
-st.caption("Upload a PDF (scanned or digital) → Submit → Download the extracted data as an Excel file.")
+st.caption("Upload a PDF (scanned or digital) → Submit → Download the extracted data as a single-sheet Excel file.")
 
 
 # ----------------------------------------------------------------------
@@ -42,18 +55,16 @@ def pdf_page_to_image(page, zoom=3.0):
 
 
 def try_extract_text_layer(page):
-    """Try to pull a structured table directly from a digital (non-scanned) PDF page."""
+    """Try to pull structured table rows directly from a digital (non-scanned) PDF page."""
     tables = page.find_tables()
     if tables and tables.tables:
-        dfs = []
+        page_rows = []
         for t in tables.tables:
             data = t.extract()
-            if data and len(data) > 1:
-                header = make_unique_headers([str(h) if h is not None else "" for h in data[0]])
-                df = pd.DataFrame(data[1:], columns=header)
-                dfs.append(df)
-        if dfs:
-            return dfs
+            if data:
+                page_rows.extend([[("" if c is None else str(c)) for c in row] for row in data])
+        if page_rows:
+            return page_rows
     return None
 
 
@@ -84,7 +95,6 @@ def ocr_page_to_rows(image, row_tolerance=12, col_gap_factor=2.2):
     if not words:
         return []
 
-    # Sort by vertical position, then group into rows using a tolerance band
     words.sort(key=lambda w: (w["top"], w["left"]))
     rows = []
     current_row = [words[0]]
@@ -99,8 +109,6 @@ def ocr_page_to_rows(image, row_tolerance=12, col_gap_factor=2.2):
             current_top = w["top"]
     rows.append(current_row)
 
-    # Within each row, sort left-to-right and merge words that are close
-    # together (same column) using a dynamic gap threshold.
     structured_rows = []
     for row in rows:
         row.sort(key=lambda w: w["left"])
@@ -122,6 +130,26 @@ def ocr_page_to_rows(image, row_tolerance=12, col_gap_factor=2.2):
     return structured_rows
 
 
+def normalize_cell(text):
+    return "".join(ch for ch in text.strip().lower() if ch.isalnum())
+
+
+def row_matches_header(row, header, threshold=0.5):
+    """Detect a repeated header row (common on every page of a scanned multi-page table)."""
+    if not header:
+        return False
+    norm_row = [normalize_cell(c) for c in row]
+    norm_header = [normalize_cell(c) for c in header]
+    compare_len = min(len(norm_row), len(norm_header))
+    if compare_len == 0:
+        return False
+    matches = sum(
+        1 for a, b in zip(norm_row[:compare_len], norm_header[:compare_len])
+        if a and b and (a == b or a in b or b in a)
+    )
+    return (matches / compare_len) >= threshold
+
+
 def make_unique_headers(header):
     """Ensure no two column names are identical (required by pandas/pyarrow for display)."""
     seen = {}
@@ -137,64 +165,66 @@ def make_unique_headers(header):
     return unique
 
 
-def rows_to_dataframe(rows):
-    """Pad rows to equal length and build a DataFrame, using the first row as header."""
-    if not rows:
+def convert_pdf_to_single_table(pdf_bytes, progress_callback=None):
+    """
+    Main pipeline — merges every page into ONE continuous table (single sheet):
+      - Tries native table extraction first (accurate for digital PDFs)
+      - Falls back to OCR-based reconstruction for scanned/image-only pages
+      - Uses the first row found as the master header
+      - Automatically skips rows on later pages that look like a repeated header
+    Returns a single pandas DataFrame.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    master_header = None
+    all_data_rows = []
+    max_cols = 0
+
+    for page_index in range(len(doc)):
+        page = doc[page_index]
+        if progress_callback:
+            progress_callback(page_index + 1, len(doc))
+
+        page_rows = try_extract_text_layer(page)
+        if not page_rows:
+            image = pdf_page_to_image(page, zoom=3.0)
+            page_rows = ocr_page_to_rows(image)
+
+        if not page_rows:
+            continue
+
+        for row in page_rows:
+            max_cols = max(max_cols, len(row))
+            if master_header is None:
+                master_header = row
+                continue
+            if row_matches_header(row, master_header):
+                continue  # skip a repeated header row from a later page
+            all_data_rows.append(row)
+
+    doc.close()
+
+    if master_header is None:
         return pd.DataFrame()
-    max_cols = max(len(r) for r in rows)
-    padded = [r + [""] * (max_cols - len(r)) for r in rows]
-    header, *body = padded
-    header = make_unique_headers(header)
+
+    def pad(r):
+        return r + [""] * (max_cols - len(r))
+
+    header = make_unique_headers(pad(master_header))
+    body = [pad(r) for r in all_data_rows]
     df = pd.DataFrame(body, columns=header)
     return df
 
 
-def convert_pdf_to_excel(pdf_bytes, progress_callback=None):
-    """
-    Main pipeline:
-      - Try to extract native tables from each page first (fast, accurate for digital PDFs)
-      - Fall back to OCR-based table reconstruction for scanned pages
-      - Returns a dict of {sheet_name: DataFrame}
-    """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    sheets = {}
-
-    for page_index in range(len(doc)):
-        page = doc[page_index]
-        sheet_name = f"Page {page_index + 1}"
-
-        if progress_callback:
-            progress_callback(page_index + 1, len(doc))
-
-        native_tables = try_extract_text_layer(page)
-        if native_tables:
-            for t_idx, df in enumerate(native_tables):
-                name = sheet_name if len(native_tables) == 1 else f"{sheet_name}_{t_idx + 1}"
-                sheets[name[:31]] = df
-            continue
-
-        # Fall back to OCR for scanned / image-only pages
-        image = pdf_page_to_image(page, zoom=3.0)
-        rows = ocr_page_to_rows(image)
-        df = rows_to_dataframe(rows)
-        if not df.empty:
-            sheets[sheet_name[:31]] = df
-
-    doc.close()
-    return sheets
-
-
-def build_excel_bytes(sheets: dict):
-    """Write all extracted tables to a single Excel workbook (one sheet per page/table)."""
+def build_excel_bytes(df: pd.DataFrame):
+    """Write the single merged table to one Excel sheet."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        if not sheets:
+        if df.empty:
             pd.DataFrame({"Message": ["No table data could be extracted."]}).to_excel(
                 writer, index=False, sheet_name="Result"
             )
-        for name, df in sheets.items():
-            safe_name = name[:31] if name else "Sheet1"
-            df.to_excel(writer, index=False, sheet_name=safe_name)
+        else:
+            df.to_excel(writer, index=False, sheet_name="Sheet1")
     output.seek(0)
     return output
 
@@ -204,8 +234,15 @@ def build_excel_bytes(sheets: dict):
 # ----------------------------------------------------------------------
 if "excel_bytes" not in st.session_state:
     st.session_state.excel_bytes = None
-if "preview_sheets" not in st.session_state:
-    st.session_state.preview_sheets = None
+if "preview_df" not in st.session_state:
+    st.session_state.preview_df = None
+
+if _TESSERACT_PATH is None:
+    st.warning(
+        "Tesseract OCR engine was not found on this system. Native-table extraction will "
+        "still work for digital PDFs, but scanned/image PDFs will fail until Tesseract is "
+        "installed (see the instructions at the top of this file / packages.txt for Streamlit Cloud)."
+    )
 
 # 1. Upload button
 uploaded_file = st.file_uploader("Upload PDF file", type=["pdf"])
@@ -220,25 +257,29 @@ if st.button("Submit", type="primary", disabled=uploaded_file is None):
             progress_bar.progress(current / total, text=f"Processing page {current} of {total}...")
 
         with st.spinner("Converting PDF to Excel — scanned pages are processed with OCR, this may take a moment..."):
-            sheets = convert_pdf_to_excel(pdf_bytes, progress_callback=update_progress)
-            excel_io = build_excel_bytes(sheets)
-
-        progress_bar.empty()
-        st.session_state.excel_bytes = excel_io.getvalue()
-        st.session_state.preview_sheets = sheets
-        st.success(f"Conversion complete — {len(sheets)} sheet(s) extracted.")
-
-# Preview extracted tables
-if st.session_state.preview_sheets:
-    st.subheader("Preview")
-    for name, df in st.session_state.preview_sheets.items():
-        with st.expander(f"Sheet: {name} ({len(df)} rows)"):
             try:
-                st.dataframe(df, use_container_width=True)
-            except Exception:
-                # Fall back to a plain string rendering if Arrow conversion fails
-                # (e.g. mixed data types or any other column-compatibility issue)
-                st.dataframe(df.astype(str), use_container_width=True)
+                df = convert_pdf_to_single_table(pdf_bytes, progress_callback=update_progress)
+                excel_io = build_excel_bytes(df)
+                st.session_state.excel_bytes = excel_io.getvalue()
+                st.session_state.preview_df = df
+                progress_bar.empty()
+                st.success(f"Conversion complete — {len(df)} rows extracted into a single sheet.")
+            except pytesseract.pytesseract.TesseractNotFoundError:
+                progress_bar.empty()
+                st.error(
+                    "Tesseract OCR engine is not installed on this server, so scanned pages "
+                    "can't be read. If you're on Streamlit Community Cloud, add a packages.txt "
+                    "file containing 'tesseract-ocr' to your repo and reboot the app. If running "
+                    "locally, install Tesseract (see instructions at the top of the script)."
+                )
+
+# Preview
+if st.session_state.preview_df is not None and not st.session_state.preview_df.empty:
+    st.subheader("Preview")
+    try:
+        st.dataframe(st.session_state.preview_df, use_container_width=True)
+    except Exception:
+        st.dataframe(st.session_state.preview_df.astype(str), use_container_width=True)
 
 # 3. Download button
 if st.session_state.excel_bytes:
